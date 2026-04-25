@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "AivisSpeech 読み上げ",
+  "version": "1.0.0",
+  "description": "選択テキストをAivisSpeech APIで読み上げます",
+  "permissions": [
+    "contextMenus",
+    "scripting",
+    "activeTab",
+    "storage"
+  ],
+  "options_page": "options.html",
+  "host_permissions": [
+    "http://192.168.11.150:10101/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
