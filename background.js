@@ -1,4 +1,4 @@
-const SPEAKER_ID = 888753763;
+const DEFAULT_SPEAKER_ID = 888753763;
 const API_BASE = 'http://192.168.11.150:10101';
 
 let _chunkIdCounter = 0;
@@ -13,6 +13,20 @@ chrome.runtime.onInstalled.addListener(() => {
     title: '読み上げ',
     contexts: ['selection'],
   });
+});
+
+// ── 設定画面からの話者一覧リクエスト ────────────
+// options.html は chrome-extension:// で動くため直接 fetch できない。
+// background SW 経由で取得して返す。
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.type === 'get-speakers') {
+    fetch(`${API_BASE}/speakers`)
+      .then(r => r.json())
+      .then(speakers => sendResponse({ speakers }))
+      .catch(err => sendResponse({ error: err.message }));
+    return true; // 非同期レスポンスのために true を返す
+  }
 });
 
 // ── 停止リクエストの受信 ─────────────────────────
@@ -43,11 +57,12 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   injectToast(tab.id, '生成中...', 'generating');
 
   const { volume } = await chrome.storage.sync.get({ volume: 100 });
+  const { speakerId } = await chrome.storage.sync.get({ speakerId: DEFAULT_SPEAKER_ID });
   const sentences = splitSentences(text);
 
   try {
     // ── 1 look-ahead パイプライン ──
-    let nextPromise = generateAudio(sentences[0]).catch(() => null);
+    let nextPromise = generateAudio(sentences[0], speakerId).catch(() => null);
 
     for (let i = 0; i < sentences.length; i++) {
       if (_sessionId !== mySession) break; // 停止 or 新しい読み上げで中断
@@ -55,7 +70,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       const currentPromise = nextPromise;
 
       if (i + 1 < sentences.length) {
-        nextPromise = generateAudio(sentences[i + 1]).catch(() => null);
+        nextPromise = generateAudio(sentences[i + 1], speakerId).catch(() => null);
       }
 
       const wavBase64 = await currentPromise;
@@ -69,7 +84,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         : '再生中...';
       injectToast(tab.id, label, 'playing');
 
-      await playChunkAndWait(tab.id, wavBase64, volume);
+      await playChunkAndWait(tab.id, wavBase64, volume, speakerId);
     }
 
     // 正常完了 or 停止完了（停止時はすでに onMessage でバッジ・トーストを片付け済み）
@@ -126,16 +141,16 @@ function splitSentences(text) {
 
 // ── 音声生成（Service Worker 内で実行） ────────────
 
-async function generateAudio(text) {
+async function generateAudio(text, speakerId) {
   const queryRes = await fetch(
-    `${API_BASE}/audio_query?text=${encodeURIComponent(text)}&speaker=${SPEAKER_ID}`,
+    `${API_BASE}/audio_query?text=${encodeURIComponent(text)}&speaker=${speakerId}`,
     { method: 'POST' }
   );
   if (!queryRes.ok) throw new Error(`audio_query HTTP ${queryRes.status}`);
   const queryJson = await queryRes.json();
 
   const synthRes = await fetch(
-    `${API_BASE}/synthesis?speaker=${SPEAKER_ID}`,
+    `${API_BASE}/synthesis?speaker=${speakerId}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
