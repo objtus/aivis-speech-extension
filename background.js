@@ -55,6 +55,8 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
   setBadge('…', '#FF9F0A');
   injectToast(tab.id, '生成中...', 'generating');
+  // AudioContext をページ側で事前初期化しておく（最初のチャンク再生時のウォームアップ遅延を防ぐ）
+  preWarmAudioContext(tab.id);
 
   const { volume } = await chrome.storage.sync.get({ volume: 100 });
   const { speakerId } = await chrome.storage.sync.get({ speakerId: DEFAULT_SPEAKER_ID });
@@ -62,7 +64,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
   try {
     // ── 1 look-ahead パイプライン ──
-    let nextPromise = generateAudio(sentences[0], speakerId).catch(() => null);
+    let nextPromise = generateAudioWithRetry(sentences[0], speakerId);
 
     for (let i = 0; i < sentences.length; i++) {
       if (_sessionId !== mySession) break; // 停止 or 新しい読み上げで中断
@@ -70,7 +72,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       const currentPromise = nextPromise;
 
       if (i + 1 < sentences.length) {
-        nextPromise = generateAudio(sentences[i + 1], speakerId).catch(() => null);
+        nextPromise = generateAudioWithRetry(sentences[i + 1], speakerId);
       }
 
       const wavBase64 = await currentPromise;
@@ -162,6 +164,24 @@ async function generateAudio(text, speakerId) {
   return arrayBufferToBase64(await synthRes.arrayBuffer());
 }
 
+// 生成失敗時に最大 maxRetries 回リトライする（指数バックオフ）
+async function generateAudioWithRetry(text, speakerId, maxRetries = 2) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await generateAudio(text, speakerId);
+    } catch (err) {
+      if (attempt < maxRetries) {
+        const wait = 700 * (attempt + 1);
+        console.warn(`[AivisSpeech] 生成リトライ ${attempt + 1}/${maxRetries} (${wait}ms待機): "${text.slice(0, 20)}..."`);
+        await new Promise(r => setTimeout(r, wait));
+      } else {
+        console.warn(`[AivisSpeech] 生成失敗（スキップ）: "${text.slice(0, 20)}..." - ${err.message}`);
+      }
+    }
+  }
+  return null;
+}
+
 // ── チャンク再生（ページに注入して完了を待つ） ────────
 
 function playChunkAndWait(tabId, wavBase64, volume) {
@@ -212,6 +232,14 @@ function injectToast(tabId, message, state) {
   }).catch(() => {});
 }
 
+// AudioContext をページ側で事前初期化する（ウォームアップ遅延の排除）
+function preWarmAudioContext(tabId) {
+  chrome.scripting.executeScript({
+    target: { tabId },
+    func: initAivisAudioContext,
+  }).catch(() => {});
+}
+
 function injectRemoveToast(tabId) {
   chrome.scripting.executeScript({
     target: { tabId },
@@ -237,6 +265,16 @@ function arrayBufferToBase64(buffer) {
 }
 
 // ── ページ注入関数（isolated world で実行） ──────────
+
+// AudioContext を事前初期化・ウォームアップ（コンテキストメニュークリック時に即呼ぶ）
+function initAivisAudioContext() {
+  if (!window.__aivisAudioCtx || window.__aivisAudioCtx.state === 'closed') {
+    window.__aivisAudioCtx = new AudioContext();
+  }
+  if (window.__aivisAudioCtx.state === 'suspended') {
+    window.__aivisAudioCtx.resume().catch(() => {});
+  }
+}
 
 // トーストの表示・更新
 function updateAivisToast(message, state) {
@@ -350,16 +388,21 @@ function updateAivisToast(message, state) {
 }
 
 // チャンク単位の再生
+// AudioContext をチャンク間で使い回すことで毎回のウォームアップ遅延（冒頭無音）を防ぐ
 async function playChunkInPage(wavBase64, volume, chunkId) {
   const notify = () => chrome.runtime.sendMessage({ type: 'chunk-ended', id: chunkId });
 
   try {
+    // 共有 AudioContext を取得（なければ新規作成）
+    if (!window.__aivisAudioCtx || window.__aivisAudioCtx.state === 'closed') {
+      window.__aivisAudioCtx = new AudioContext();
+    }
+    const audioCtx = window.__aivisAudioCtx;
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
     const binary = atob(wavBase64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-
-    const audioCtx = new AudioContext();
-    if (audioCtx.state === 'suspended') await audioCtx.resume();
 
     const audioBuffer = await audioCtx.decodeAudioData(bytes.buffer);
     const source = audioCtx.createBufferSource();
@@ -376,11 +419,11 @@ async function playChunkInPage(wavBase64, volume, chunkId) {
 
     source.onended = () => {
       document.removeEventListener('__aivis_stop_audio', stopHandler);
-      audioCtx.close().catch(() => {});
+      // AudioContext は閉じずに次チャンクのために維持する
       notify();
     };
 
-    source.start(0);
+    source.start();
 
   } catch (err) {
     notify();
